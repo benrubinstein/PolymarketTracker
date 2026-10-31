@@ -32,6 +32,8 @@ TRADERS = {
 
 TARGET_DATE = "2026-10-31"
 MIN_TRADERS = 2
+SPORTS = {'NBA', 'NFL', 'SOCCER'}
+SOCCER_LEAGUES = {'epl', 'bun', 'lal', 'sea', 'lig', 'ucl', 'uel', 'mls', 'ered', 'rus', 'por', 'sco', 'bra', 'arg', 'mex'}
 MIN_NET_SHARES = 1.0
 PAGE_SIZE = 500
 MAX_PAGES = 40
@@ -43,6 +45,17 @@ def numeric(value):
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+def sport_for(position):
+    slug = str(position.get('eventSlug') or position.get('slug') or '').lower()
+    prefix = slug.split('-', 1)[0]
+    if prefix == 'nba':
+        return 'NBA'
+    if prefix == 'nfl':
+        return 'NFL'
+    if prefix in SOCCER_LEAGUES:
+        return 'SOCCER'
+    return None
 
 def event_on_date(position):
     # Only include a market if its event slug explicitly identifies the date.
@@ -91,7 +104,7 @@ def main():
             # Include observed positions, but flag these traders as partial.
             # Their missing positions may change net direction.
         for p in positions:
-            if not event_on_date(p):
+            if not event_on_date(p) or sport_for(p) not in SPORTS:
                 continue
             condition = p.get("conditionId")
             outcome = p.get("outcome")
@@ -102,6 +115,7 @@ def main():
             exposure[condition][name][outcome] += size
             meta.setdefault(condition, {
                 "title": str(p.get("title") or "Unknown market"),
+                "sport": sport_for(p),
                 "slug": str(p.get("eventSlug") or p.get("slug") or ""),
             })
 
@@ -127,6 +141,7 @@ def main():
                 continue
             info = meta[condition]
             results.append({
+                "sport": info["sport"],
                 "market": info["title"],
                 "outcome": outcome,
                 "traders": len(people),
@@ -136,10 +151,10 @@ def main():
                 "condition_id": condition,
                 "confidence_note": "partial scan involved" if any(name in incomplete for name, _ in people) else ("opposite side not observed" if len({side for ss in traders.values() for side in ss}) == 1 else "both sides observed"),
             })
-    results.sort(key=lambda r: (-r["traders"], -r["net_shares"]))
+    results.sort(key=lambda r: ({"NBA": 0, "NFL": 1, "SOCCER": 2}[r["sport"]], -r["traders"], -r["net_shares"]))
     with open(OUTPUT, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=[
-            "market", "outcome", "traders", "net_shares",
+            "sport", "market", "outcome", "traders", "net_shares",
             "supporters", "url", "condition_id", "confidence_note"
         ])
         writer.writeheader()
