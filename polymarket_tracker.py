@@ -279,7 +279,7 @@ def render(rows, partial, scanned):
                 value = f"${float(r['observed_value_usd']):,.2f}" if r["observed_value_usd"] != "" else "N/A"
                 cost = f"${float(r['observed_cost_usd']):,.2f}" if r["observed_cost_usd"] != "" else "N/A"
                 blocks.append(
-                    "<article><div class='top'><strong>" + esc(r["market"]) +
+                    "<article data-sport='" + esc(r["sport"]) + "' data-count='" + esc(r["traders"]) + "' data-shares='" + esc(r["net_shares"]) + "'><p class='muted'>" + esc(r["market_type"]) + " · " + esc(r["meaningful_traders"]) + " meaningful trader(s) · Largest " + esc(r["largest_trader_pct"]) + "% · Sampled buys/sells: " + esc(r["recent_sample_buys"]) + "/" + esc(r["recent_sample_sells"]) + "</p><div class='top'><strong>" + esc(r["market"]) +
                     "</strong><span class='pill'>" + esc(r["traders"]) + " trader(s)</span></div>" +
                     "<div class='outcome'>" + esc(r["outcome"]) + "</div>" +
                     "<div class='metrics'><div>Net shares<b>" + esc(r["net_shares"]) +
@@ -319,7 +319,21 @@ section{margin-top:30px}article{background:#152138;border:1px solid #293a58;bord
     doc += f"<p>{len(TRADERS)} tracked traders · {len(partial)} incomplete scans · {len(rows)} outcome rows</p>"
     if partial:
         doc += "<p class='warning'>Incomplete accounts: " + esc(", ".join(sorted(partial))) + "</p>"
-    doc += body + "</body></html>"
+    doc += """<div class='notice'><label>Sport <select id='sport'><option value='ALL'>All</option><option>NBA</option><option>NFL</option><option>SOCCER</option></select></label> <label>View <select id='view'><option value='ALL'>All</option><option value='2'>Consensus</option><option value='1'>Singles</option></select></label> <label>Minimum shares <input id='minimum' type='number' value='0' min='0'></label></div>"""
+    doc += body
+    doc += """<script>
+function filterCards(){
+ const sport=document.getElementById('sport').value;
+ const view=document.getElementById('view').value;
+ const min=Number(document.getElementById('minimum').value)||0;
+ document.querySelectorAll('article[data-sport]').forEach(card=>{
+  const n=Number(card.dataset.count);
+  card.style.display=(sport==='ALL'||sport===card.dataset.sport)&&
+   (view==='ALL'||(view==='2'?n>=2:n===1))&&Number(card.dataset.shares)>=min?'':'none';
+ });
+}
+['sport','view','minimum'].forEach(id=>document.getElementById(id).addEventListener('input',filterCards));
+</script></body></html>"""
     Path(HTML_FILE).write_text(doc, encoding="utf-8")
 
 def main():
