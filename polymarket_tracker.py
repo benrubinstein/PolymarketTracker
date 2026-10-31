@@ -38,6 +38,8 @@ DATE = sys.argv[1] if len(sys.argv) > 1 else "2026-10-31"
 PAGE_SIZE = 500
 MAX_PAGES = 40
 MIN_SHARES = 1.0
+MIN_ALLOCATION_PCT = 1.0
+MIN_STRONG_TRADERS = 5
 API = "https://data-api.polymarket.com/positions"
 CSV_FILE = "polymarket_positions.csv"
 HTML_FILE = "polymarket_report.html"
@@ -126,11 +128,13 @@ def build():
     meta = {}
     partial = set()
     scanned = {}
+    portfolio_values = {}
     activity = defaultdict(lambda: defaultdict(lambda: {"buys": 0, "sells": 0, "buy_usd": 0.0, "sell_usd": 0.0}))
     for name, wallet in TRADERS.items():
         print(f"Checking {name}...", flush=True)
         positions, complete = fetch_positions(session, name, wallet)
         scanned[name] = len(positions)
+        portfolio_values[name] = sum(max(0.0, number(p.get('currentValue'))) for p in positions)
         for trade in recent_activity(session, wallet):
             cid = trade.get("conditionId")
             side = str(trade.get("side") or "").upper()
@@ -192,7 +196,12 @@ def build():
                 if net_shares < MIN_SHARES:
                     continue
             data = sides[winning]
+            denominator = portfolio_values.get(name, 0.0)
+            net_price = data['price_weight'] / data['price_shares'] if data['price_shares'] else None
+            allocation = 100 * net_shares * net_price / denominator if net_price is not None and denominator > 0 else None
             by_side[winning].append({
+                'allocation_pct': allocation,
+                'strong': allocation is not None and allocation >= MIN_ALLOCATION_PCT and name not in partial and len(outcomes) == 2,
                 "name": name, "shares": net_shares,
                 "value": data["current_value"] if data["has_current"] else None,
                 "cost": data["initial_value"] if data["has_initial"] else None,
@@ -211,6 +220,7 @@ def build():
             largest_pct = 100 * max(s["shares"] for s in supporters) / total_shares if total_shares else 0
             biggest = max(s["shares"] for s in supporters)
             meaningful = sum(s["shares"] >= biggest * 0.1 for s in supporters)
+            strong_supporters = [s for s in supporters if s['strong']]
             sample_buys = sum(s["activity"]["buys"] for s in supporters)
             sample_sells = sum(s["activity"]["sells"] for s in supporters)
             if len(supporters) >= 2 and largest_pct >= 90:
@@ -226,6 +236,9 @@ def build():
             if len(values) != len(supporters):
                 warnings.append("Some values unavailable")
             rows.append({
+                'strong_traders': len(strong_supporters),
+                'strong_consensus': len(strong_supporters) >= MIN_STRONG_TRADERS,
+                'allocation_coverage': f"{sum(s['allocation_pct'] is not None for s in supporters)}/{len(supporters)}",
                 "sport": info["sport"], "market": info["market"],
                 "market_type": market_type(info["market"]),
                 "largest_trader_pct": round(largest_pct, 1),
@@ -241,6 +254,8 @@ def build():
                 "price_coverage": f"{len(prices)}/{len(supporters)}",
                 "supporters": "; ".join(
                     f"{s['name']} ({s['shares']:,.0f} net shares"
+                    + (f", {s['allocation_pct']:.2f}% visible holdings" if s['allocation_pct'] is not None else ', allocation unknown')
+                    + (', STRONG' if s['strong'] else '')
                     + (f", ${s['value']:,.2f} current outcome value" if s["value"] is not None else "")
                     + ")" for s in sorted(supporters, key=lambda x: -x["shares"])
                 ),
@@ -249,11 +264,11 @@ def build():
                 "condition_id": cid,
             })
     order = {"NBA": 0, "NFL": 1, "SOCCER": 2}
-    rows.sort(key=lambda r: (order[r["sport"]], -r["traders"], -r["net_shares"]))
+    rows.sort(key=lambda r: (order[r['sport']], -r['strong_traders'], -r['traders'], -r['net_shares']))
     return rows, partial, scanned
 
 def save_csv(rows):
-    fields = ["sport", "market", "market_type", "outcome", "traders", "largest_trader_pct", "meaningful_traders", "recent_sample_buys", "recent_sample_sells", "net_shares",
+    fields = ['strong_traders', 'strong_consensus', 'allocation_coverage', "sport", "market", "market_type", "outcome", "traders", "largest_trader_pct", "meaningful_traders", "recent_sample_buys", "recent_sample_sells", "net_shares",
               "observed_value_usd", "value_coverage", "observed_cost_usd",
               "price_snapshot", "price_coverage", "supporters", "quality",
               "event_url", "condition_id"]
@@ -267,10 +282,10 @@ def render(rows, partial, scanned):
     blocks = []
     for sport in ("NBA", "NFL", "SOCCER"):
         subset = [r for r in rows if r["sport"] == sport]
-        consensus = [r for r in subset if r["traders"] >= 2]
-        singles = [r for r in subset if r["traders"] == 1]
+        consensus = [r for r in subset if r['strong_consensus']]
+        singles = [r for r in subset if not r['strong_consensus']]
         blocks.append(f"<section><h2>{sport} · {len(consensus)} consensus / {len(singles)} singles</h2>")
-        for label, group in (("Consensus (2+)", consensus), ("Single-trader positions", singles)):
+        for label, group in (("Strong consensus (5+ at 1%+)", consensus), ("Other observed positions", singles)):
             blocks.append(f"<h3>{label}</h3>")
             if not group:
                 blocks.append("<p class='muted'>No qualifying positions observed.</p>")
@@ -279,7 +294,7 @@ def render(rows, partial, scanned):
                 value = f"${float(r['observed_value_usd']):,.2f}" if r["observed_value_usd"] != "" else "N/A"
                 cost = f"${float(r['observed_cost_usd']):,.2f}" if r["observed_cost_usd"] != "" else "N/A"
                 blocks.append(
-                    "<article data-sport='" + esc(r["sport"]) + "' data-count='" + esc(r["traders"]) + "' data-shares='" + esc(r["net_shares"]) + "'><p class='muted'>" + esc(r["market_type"]) + " · " + esc(r["meaningful_traders"]) + " meaningful trader(s) · Largest " + esc(r["largest_trader_pct"]) + "% · Sampled buys/sells: " + esc(r["recent_sample_buys"]) + "/" + esc(r["recent_sample_sells"]) + "</p><div class='top'><strong>" + esc(r["market"]) +
+                    "<article data-sport='" + esc(r["sport"]) + "' data-count='" + esc(r['strong_traders']) + "' data-shares='" + esc(r["net_shares"]) + "'><p class='muted'>" + esc(r["market_type"]) + " · " + esc(r["meaningful_traders"]) + " meaningful trader(s) · Largest " + esc(r["largest_trader_pct"]) + "% · Strong supporters: " + esc(r['strong_traders']) + " · Allocation coverage: " + esc(r['allocation_coverage']) + " · Sampled buys/sells: " + esc(r["recent_sample_buys"]) + "/" + esc(r["recent_sample_sells"]) + "</p><div class='top'><strong>" + esc(r["market"]) +
                     "</strong><span class='pill'>" + esc(r["traders"]) + " trader(s)</span></div>" +
                     "<div class='outcome'>" + esc(r["outcome"]) + "</div>" +
                     "<div class='metrics'><div>Net shares<b>" + esc(r["net_shares"]) +
@@ -315,11 +330,11 @@ section{margin-top:30px}article{background:#152138;border:1px solid #293a58;bord
 .notice{padding:15px;background:#1b2941;border-radius:12px;border-left:3px solid #89b6ff}
 </style></head><body>"""
     doc += f"<h1>Polymarket Sports Tracker</h1><p class='muted'>Event date: {esc(DATE)} · NBA / NFL / Soccer</p>"
-    doc += "<div class='notice'><b>Interpretation:</b> This is a position-overlap monitor, not a recommendation or performance forecast. Dollar values and prices are position API snapshots, not live executable quotes. An observed value total is partial when coverage is below the number of supporters. Current value is not invested cost. One-sided markets and incomplete account scans cannot establish reliable net exposure.</div>"
+    doc += "<div class='notice'><b>Interpretation:</b> Strong consensus requires five complete-scan traders each with at least 1% of visible position value allocated to a net side, with both sides observed. Visible holdings exclude cash and may be incomplete. This is a position-overlap monitor, not a recommendation or performance forecast. Dollar values and prices are position API snapshots, not live executable quotes. An observed value total is partial when coverage is below the number of supporters. Current value is not invested cost. One-sided markets and incomplete account scans cannot establish reliable net exposure.</div>"
     doc += f"<p>{len(TRADERS)} tracked traders · {len(partial)} incomplete scans · {len(rows)} outcome rows</p>"
     if partial:
         doc += "<p class='warning'>Incomplete accounts: " + esc(", ".join(sorted(partial))) + "</p>"
-    doc += """<div class='notice'><label>Sport <select id='sport'><option value='ALL'>All</option><option>NBA</option><option>NFL</option><option>SOCCER</option></select></label> <label>View <select id='view'><option value='ALL'>All</option><option value='2'>Consensus</option><option value='1'>Singles</option></select></label> <label>Minimum shares <input id='minimum' type='number' value='0' min='0'></label></div>"""
+    doc += """<div class='notice'><label>Sport <select id='sport'><option value='ALL'>All</option><option>NBA</option><option>NFL</option><option>SOCCER</option></select></label> <label>View <select id='view'><option value='ALL'>All</option><option value='2'>Strong consensus</option><option value='1'>Other positions</option></select></label> <label>Minimum shares <input id='minimum' type='number' value='0' min='0'></label></div>"""
     doc += body
     doc += """<script>
 function filterCards(){
@@ -343,10 +358,10 @@ def main():
     print(f"\nSaved {len(rows)} outcomes to {CSV_FILE} and {HTML_FILE}")
     for sport in ("NBA", "NFL", "SOCCER"):
         subset = [r for r in rows if r["sport"] == sport]
-        print(f"{sport}: {sum(r['traders'] >= 2 for r in subset)} consensus, "
-              f"{sum(r['traders'] == 1 for r in subset)} single-trader outcomes")
+        print(f"{sport}: {sum(r['strong_consensus'] for r in subset)} consensus, "
+              f"{sum(not r['strong_consensus'] for r in subset)} single-trader outcomes")
         for r in subset:
-            if r["traders"] >= 2:
+            if r['strong_consensus']:
                 print(f"  {r['traders']} traders | {r['market']} | {r['outcome']} | {r['quality']}")
     print("Partial scans:", ", ".join(sorted(partial)) if partial else "none")
     print("Open polymarket_report.html in your browser to view the dashboard.")
