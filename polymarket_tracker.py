@@ -31,7 +31,7 @@ TRADERS = {
 }
 
 TARGET_DATE = "2026-10-31"
-MIN_TRADERS = 5
+MIN_TRADERS = 2
 MIN_NET_SHARES = 1.0
 PAGE_SIZE = 500
 MAX_PAGES = 40
@@ -88,8 +88,8 @@ def main():
         positions, complete = fetch_positions(session, name, wallet)
         if not complete:
             incomplete.append(name)
-            # Do not count partial portfolios as full trader votes.
-            continue
+            # Include observed positions, but flag these traders as partial.
+            # Their missing positions may change net direction.
         for p in positions:
             if not event_on_date(p):
                 continue
@@ -113,10 +113,11 @@ def main():
             # seen in this market across scanned traders.
             all_sides = {side for trader_sides in traders.values()
                          for side in trader_sides}
-            if len(all_sides) != 2:
+            if len(all_sides) == 0 or len(all_sides) > 2:
                 continue
-            side_a, side_b = sorted(all_sides)
-            net = sides.get(side_a, 0) - sides.get(side_b, 0)
+            side_a = sorted(all_sides)[0]
+            side_b = sorted(all_sides)[1] if len(all_sides) == 2 else None
+            net = sides.get(side_a, 0) - sides.get(side_b, 0) if side_b else sides.get(side_a, 0)
             if abs(net) < MIN_NET_SHARES:
                 continue
             winner = side_a if net > 0 else side_b
@@ -133,12 +134,13 @@ def main():
                 "supporters": ", ".join(f"{name} ({amount:.2f})" for name, amount in sorted(people)),
                 "url": "https://polymarket.com/event/" + info["slug"],
                 "condition_id": condition,
+                "confidence_note": "partial scan involved" if any(name in incomplete for name, _ in people) else ("opposite side not observed" if len({side for ss in traders.values() for side in ss}) == 1 else "both sides observed"),
             })
     results.sort(key=lambda r: (-r["traders"], -r["net_shares"]))
     with open(OUTPUT, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=[
             "market", "outcome", "traders", "net_shares",
-            "supporters", "url", "condition_id"
+            "supporters", "url", "condition_id", "confidence_note"
         ])
         writer.writeheader()
         writer.writerows(results)
@@ -149,9 +151,12 @@ def main():
         print(f"\n{row['traders']} traders | {row['market']} | {row['outcome']}")
         print(row["supporters"])
         print(row["url"])
+        print("CAVEAT:", row["confidence_note"])
     print(f"\nSaved {len(results)} results to {OUTPUT}")
     if incomplete:
-        print("INCOMPLETE/EXCLUDED traders:", ", ".join(incomplete))
+        print("INCOMPLETE/PARTIAL traders:", ", ".join(incomplete))
+    print("NOTE: A one-sided market is NOT verified net exposure; missing opposing positions can reverse it.")
+    print("NOTE: Partial trader scans are provisional; no matches are betting recommendations.")
     print("NOTE: Net shares do not equal dollars, profit, or a reliable prediction.")
     print("NOTE: Date is inferred from event slug, not verified start time.")
 
