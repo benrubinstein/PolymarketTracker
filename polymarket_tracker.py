@@ -263,12 +263,47 @@ def build():
                 "event_url": "https://polymarket.com/event/" + info["slug"],
                 "condition_id": cid,
             })
-    order = {"NBA": 0, "NFL": 1, "SOCCER": 2}
-    rows.sort(key=lambda r: (order[r['sport']], -r['strong_traders'], -r['traders'], -r['net_shares']))
+    # Heuristic ranking, NOT a win-probability or expected-value estimate.
+    for r in rows:
+        same = r['strong_traders']
+        opposite = sum(
+            x['strong_traders'] for x in rows
+            if x['condition_id'] == r['condition_id'] and x['outcome'] != r['outcome']
+        )
+        r['opposing_strong_traders'] = opposite
+        allocations = []
+        for name, sides in holdings[r['condition_id']].items():
+            if name in partial or len({o for ss in holdings[r['condition_id']].values() for o in ss}) != 2:
+                continue
+            outcomes = sorted({o for ss in holdings[r['condition_id']].values() for o in ss})
+            net = sides[outcomes[0]]['shares'] - sides[outcomes[1]]['shares']
+            if (net > 0 and r['outcome'] != outcomes[0]) or (net < 0 and r['outcome'] != outcomes[1]):
+                continue
+            if abs(net) < MIN_SHARES:
+                continue
+            data = sides[r['outcome']]
+            denom = portfolio_values.get(name, 0)
+            if data['price_shares'] and denom:
+                pct = 100 * abs(net) * data['price_weight'] / data['price_shares'] / denom
+                if pct >= MIN_ALLOCATION_PCT:
+                    allocations.append(pct)
+        allocations.sort()
+        median = (allocations[(len(allocations)-1)//2] + allocations[len(allocations)//2])/2 if allocations else 0
+        r['median_strong_allocation_pct'] = round(median, 2)
+        # Scores capped so one large trader cannot dominate.
+        breadth = min(same / 8, 1)
+        allocation = min(median / 5, 1)
+        agreement = same / (same + opposite) if same + opposite else 0
+        coverage = number(r['allocation_coverage'].split('/')[0]) / max(r['traders'], 1)
+        quality = coverage * (1 if 'Incomplete trader scan' not in r['quality'] else 0.5) * (1 if 'Opposing side not observed' not in r['quality'] else 0.25)
+        r['conviction_score'] = round(100 * (0.35*breadth + 0.30*allocation + 0.20*agreement + 0.15*quality), 1)
+    rows.sort(key=lambda r: (-int(r['strong_consensus']), -r['conviction_score'], -r['strong_traders'], r['sport'], r['market']))
+    for index, r in enumerate(rows, 1):
+        r['rank'] = index
     return rows, partial, scanned
 
 def save_csv(rows):
-    fields = ['strong_traders', 'strong_consensus', 'allocation_coverage', "sport", "market", "market_type", "outcome", "traders", "largest_trader_pct", "meaningful_traders", "recent_sample_buys", "recent_sample_sells", "net_shares",
+    fields = ['rank', 'conviction_score', 'median_strong_allocation_pct', 'opposing_strong_traders', 'strong_traders', 'strong_consensus', 'allocation_coverage', "sport", "market", "market_type", "outcome", "traders", "largest_trader_pct", "meaningful_traders", "recent_sample_buys", "recent_sample_sells", "net_shares",
               "observed_value_usd", "value_coverage", "observed_cost_usd",
               "price_snapshot", "price_coverage", "supporters", "quality",
               "event_url", "condition_id"]
@@ -280,11 +315,18 @@ def save_csv(rows):
 def render(rows, partial, scanned):
     esc = lambda x: html.escape(str(x), quote=True)
     blocks = []
+    ranked = [r for r in rows if r['strong_consensus']]
+    blocks.append("<section><h2>Top ranked consensus bets</h2><p class='muted'>Ranked by heuristic conviction score, not predicted profit or win probability.</p>")
+    if not ranked:
+        blocks.append("<p class='muted'>No outcomes meet the five-trader, 1% allocation threshold. Lower-ranked observations are shown by sport below.</p>")
+    for r in ranked:
+        blocks.append("<article><div class='top'><strong>#" + esc(r['rank']) + " · " + esc(r['market']) + "</strong><span class='pill'>" + esc(r['conviction_score']) + "/100</span></div><div class='outcome'>" + esc(r['outcome']) + "</div><p>" + esc(r['sport']) + " · " + esc(r['strong_traders']) + " strong supporters · " + esc(r['opposing_strong_traders']) + " strong opposing · Median allocation " + esc(r['median_strong_allocation_pct']) + "%</p><p class='warning'>" + esc(r['quality']) + "</p><a href='" + esc(r['event_url']) + "' target='_blank' rel='noopener noreferrer'>Open market</a></article>")
+    blocks.append("</section>")
     for sport in ("NBA", "NFL", "SOCCER"):
         subset = [r for r in rows if r["sport"] == sport]
         consensus = [r for r in subset if r['strong_consensus']]
         singles = [r for r in subset if not r['strong_consensus']]
-        blocks.append(f"<section><h2>{sport} · {len(consensus)} consensus / {len(singles)} singles</h2>")
+        blocks.append(f"<section><h2>{sport} · {len(consensus)} strong consensus / {len(singles)} other outcomes</h2>")
         for label, group in (("Strong consensus (5+ at 1%+)", consensus), ("Other observed positions", singles)):
             blocks.append(f"<h3>{label}</h3>")
             if not group:
@@ -296,7 +338,7 @@ def render(rows, partial, scanned):
                 blocks.append(
                     "<article data-sport='" + esc(r["sport"]) + "' data-count='" + esc(r['strong_traders']) + "' data-shares='" + esc(r["net_shares"]) + "'><p class='muted'>" + esc(r["market_type"]) + " · " + esc(r["meaningful_traders"]) + " meaningful trader(s) · Largest " + esc(r["largest_trader_pct"]) + "% · Strong supporters: " + esc(r['strong_traders']) + " · Allocation coverage: " + esc(r['allocation_coverage']) + " · Sampled buys/sells: " + esc(r["recent_sample_buys"]) + "/" + esc(r["recent_sample_sells"]) + "</p><div class='top'><strong>" + esc(r["market"]) +
                     "</strong><span class='pill'>" + esc(r["traders"]) + " trader(s)</span></div>" +
-                    "<div class='outcome'>" + esc(r["outcome"]) + "</div>" +
+                    "<div class='outcome'>#" + esc(r['rank']) + " · " + esc(r["outcome"]) + " · Conviction " + esc(r['conviction_score']) + "/100</div>" +
                     "<div class='metrics'><div>Net shares<b>" + esc(r["net_shares"]) +
                     "</b></div><div>Observed value<b>" + esc(value) +
                     "</b><small>Coverage " + esc(r["value_coverage"]) +
@@ -330,7 +372,7 @@ section{margin-top:30px}article{background:#152138;border:1px solid #293a58;bord
 .notice{padding:15px;background:#1b2941;border-radius:12px;border-left:3px solid #89b6ff}
 </style></head><body>"""
     doc += f"<h1>Polymarket Sports Tracker</h1><p class='muted'>Event date: {esc(DATE)} · NBA / NFL / Soccer</p>"
-    doc += "<div class='notice'><b>Interpretation:</b> Strong consensus requires five complete-scan traders each with at least 1% of visible position value allocated to a net side, with both sides observed. Visible holdings exclude cash and may be incomplete. This is a position-overlap monitor, not a recommendation or performance forecast. Dollar values and prices are position API snapshots, not live executable quotes. An observed value total is partial when coverage is below the number of supporters. Current value is not invested cost. One-sided markets and incomplete account scans cannot establish reliable net exposure.</div>"
+    doc += "<div class='notice'><b>Interpretation:</b> The conviction score ranks observed consensus only; it does not estimate win probability, betting value, or expected return. Strong consensus requires five complete-scan traders each with at least 1% of visible position value allocated to a net side, with both sides observed. Visible holdings exclude cash and may be incomplete. This is a position-overlap monitor, not a recommendation or performance forecast. Dollar values and prices are position API snapshots, not live executable quotes. An observed value total is partial when coverage is below the number of supporters. Current value is not invested cost. One-sided markets and incomplete account scans cannot establish reliable net exposure.</div>"
     doc += f"<p>{len(TRADERS)} tracked traders · {len(partial)} incomplete scans · {len(rows)} outcome rows</p>"
     if partial:
         doc += "<p class='warning'>Incomplete accounts: " + esc(", ".join(sorted(partial))) + "</p>"
