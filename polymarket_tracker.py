@@ -41,6 +41,7 @@ MIN_SHARES = 1.0
 API = "https://data-api.polymarket.com/positions"
 CSV_FILE = "polymarket_positions.csv"
 HTML_FILE = "polymarket_report.html"
+ACTIVITY_API = "https://data-api.polymarket.com/activity"
 SOCCER = {"epl", "bun", "lal", "sea", "lig", "ucl", "uel", "uecl", "mls",
           "ered", "rus", "por", "sco", "bra", "arg", "mex", "tur", "bel",
           "fra", "esp", "ita", "ger", "eng", "ned", "sau", "wc", "cwc"}
@@ -90,6 +91,29 @@ def fetch_positions(session, name, wallet):
     print(f"  {len(positions)} positions; complete={complete}", flush=True)
     return positions, complete
 
+def market_type(title):
+    t = title.lower()
+    if "spread:" in t:
+        return "Spread"
+    if "o/u" in t or "over/under" in t or "total goals" in t:
+        return "Total"
+    if "halftime" in t or "half-time" in t:
+        return "Halftime"
+    if t.startswith("will "):
+        return "Yes/No proposition"
+    if " vs." in t or " vs " in t:
+        return "Match winner / other"
+    return "Other"
+
+def recent_activity(session, wallet):
+    try:
+        r = session.get(ACTIVITY_API, params={"user": wallet, "type": "TRADE", "limit": 500}, timeout=25)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except (requests.RequestException, ValueError):
+        return []
+
 def build():
     date.fromisoformat(DATE)
     session = requests.Session()
@@ -102,10 +126,21 @@ def build():
     meta = {}
     partial = set()
     scanned = {}
+    activity = defaultdict(lambda: defaultdict(lambda: {"buys": 0, "sells": 0, "buy_usd": 0.0, "sell_usd": 0.0}))
     for name, wallet in TRADERS.items():
         print(f"Checking {name}...", flush=True)
         positions, complete = fetch_positions(session, name, wallet)
         scanned[name] = len(positions)
+        for trade in recent_activity(session, wallet):
+            cid = trade.get("conditionId")
+            side = str(trade.get("side") or "").upper()
+            if not cid or side not in ("BUY", "SELL"):
+                continue
+            dollars = number(trade.get("usdcSize")) or number(trade.get("size")) * number(trade.get("price"))
+            key = "buys" if side == "BUY" else "sells"
+            usd_key = "buy_usd" if side == "BUY" else "sell_usd"
+            activity[cid][name][key] += 1
+            activity[cid][name][usd_key] += dollars
         if not complete:
             partial.add(name)
         for p in positions:
@@ -163,7 +198,8 @@ def build():
                 "cost": data["initial_value"] if data["has_initial"] else None,
                 "price": (data["price_weight"] / data["price_shares"])
                          if data["price_shares"] else None,
-                "partial": name in partial
+                "partial": name in partial,
+                "activity": activity[cid][name]
             })
         for outcome, supporters in by_side.items():
             info = meta[cid]
@@ -171,6 +207,14 @@ def build():
             values = [s["value"] for s in supporters if s["value"] is not None]
             costs = [s["cost"] for s in supporters if s["cost"] is not None]
             warnings = []
+            total_shares = sum(s["shares"] for s in supporters)
+            largest_pct = 100 * max(s["shares"] for s in supporters) / total_shares if total_shares else 0
+            biggest = max(s["shares"] for s in supporters)
+            meaningful = sum(s["shares"] >= biggest * 0.1 for s in supporters)
+            sample_buys = sum(s["activity"]["buys"] for s in supporters)
+            sample_sells = sum(s["activity"]["sells"] for s in supporters)
+            if len(supporters) >= 2 and largest_pct >= 90:
+                warnings.append("One trader dominates observed shares")
             if any(s["partial"] for s in supporters):
                 warnings.append("Incomplete trader scan")
             if len(outcomes) == 1:
@@ -183,6 +227,11 @@ def build():
                 warnings.append("Some values unavailable")
             rows.append({
                 "sport": info["sport"], "market": info["market"],
+                "market_type": market_type(info["market"]),
+                "largest_trader_pct": round(largest_pct, 1),
+                "meaningful_traders": meaningful,
+                "recent_sample_buys": sample_buys,
+                "recent_sample_sells": sample_sells,
                 "outcome": outcome, "traders": len(supporters),
                 "net_shares": round(sum(s["shares"] for s in supporters), 2),
                 "observed_value_usd": round(sum(values), 2) if values else "",
@@ -204,7 +253,7 @@ def build():
     return rows, partial, scanned
 
 def save_csv(rows):
-    fields = ["sport", "market", "outcome", "traders", "net_shares",
+    fields = ["sport", "market", "market_type", "outcome", "traders", "largest_trader_pct", "meaningful_traders", "recent_sample_buys", "recent_sample_sells", "net_shares",
               "observed_value_usd", "value_coverage", "observed_cost_usd",
               "price_snapshot", "price_coverage", "supporters", "quality",
               "event_url", "condition_id"]
